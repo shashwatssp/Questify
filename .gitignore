@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.venv/
+venv/
+env/
+.env
+images/
+output/
+*.zip
+*.json
+test_api.ps1
