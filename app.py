@@ -25,14 +25,17 @@ GET  /docs     — FastAPI's auto-generated OpenAPI UI.
 import asyncio
 import base64
 import io
+import json
 import os
 import shutil
 import tempfile
+import threading
+from queue import SimpleQueue
 from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 
 from extractor import process_pdf
@@ -115,8 +118,23 @@ def _image_backed_question(b64: str, source_name: str) -> dict:
     }
 
 
+def _inline_images(result: dict) -> dict:
+    """Inline each question's rendered image + figures as base64 data-URLs
+    so the frontend needs no second request. Shared by POST /extract and
+    POST /extract/stream so both return identical payloads."""
+    data = result["data"]
+    img_dir = result["img_dir"]
+    for q in data.get("questions", []):
+        if q.get("rendered_image"):
+            q["rendered_image_b64"] = _to_data_url(img_dir, q["rendered_image"])
+        for fig in q.get("figures", []):
+            if fig.get("path"):
+                fig["image_b64"] = _to_data_url(img_dir, fig["path"])
+    return data
+
+
 def _process_pdf_sync(tmp_path: str) -> dict:
-    """Run process_pdf + inline rendered images as base64.
+    """Run process_pdf + inline images as base64.
 
     Extracted into a standalone sync function so the async /extract endpoint
     can offload it to a thread via asyncio.to_thread, which keeps uvicorn's
@@ -125,15 +143,7 @@ def _process_pdf_sync(tmp_path: str) -> dict:
     so there are no shared-file collisions across concurrent invocations.
     """
     result = process_pdf(tmp_path)
-    data = result["data"]
-    img_dir = result["img_dir"]
-    # Inline images as base64 so the frontend needs no second request.
-    for q in data.get("questions", []):
-        if q.get("rendered_image"):
-            q["rendered_image_b64"] = _to_data_url(img_dir, q["rendered_image"])
-        for fig in q.get("figures", []):
-            if fig.get("path"):
-                fig["image_b64"] = _to_data_url(img_dir, fig["path"])
+    _inline_images(result)  # mutates result["data"] in place; keep full dict for cleanup
     return result
 
 
@@ -185,3 +195,73 @@ async def extract(file: UploadFile = File(...)):
         shutil.rmtree(upload_dir, ignore_errors=True)
         if result is not None:
             shutil.rmtree(os.path.dirname(result["img_dir"]), ignore_errors=True)
+
+
+@app.post("/extract/stream")
+async def extract_stream(file: UploadFile = File(...)):
+    """Stream extraction progress as Server-Sent Events.
+
+    POST is required because the upload body cannot be sent via a GET
+    (the browser EventSource API only issues GETs); the response body still
+    uses the standard SSE wire format so the frontend parses it with the
+    Streams API. Emits, in order: progress-start, one progress-question per
+    extracted question, then progress-done (or progress-error). POST /extract
+    remains the non-streaming fallback and returns an identical payload.
+    """
+    upload_dir = tempfile.mkdtemp(prefix="questify_upload_")
+    base = (file.filename or "upload")
+    for c in ("/", " ", chr(92)):
+        base = base.replace(c, "_")
+    content = await file.read()
+    kind = _media_kind(content)
+    if not kind:
+        raise HTTPException(400, "Only PDF or image files are supported.")
+    tmp_path = os.path.join(upload_dir, base if kind == "pdf" else f"upload.{kind}")
+    with open(tmp_path, "wb") as f:
+        f.write(content)
+
+    q: SimpleQueue = SimpleQueue()
+
+    def on_progress(event: dict) -> None:
+        q.put(event)
+
+    def worker() -> None:
+        result = None
+        try:
+            if kind == "pdf":
+                result = process_pdf(tmp_path, on_progress=on_progress)
+                data = _inline_images(result)
+            else:
+                # Raster image: single image-backed question (no text layer).
+                data = _process_image_sync(content, base)
+                q.put({"event": "progress-start",
+                       "data": {"total_pages": 1, "total_questions": 1}})
+                q.put({"event": "progress-question",
+                       "data": {"index": 1, "count": 1, "total": 1, "page": 1}})
+            q.put({"event": "progress-done", "data": data})
+        except Exception as e:
+            q.put({"event": "progress-error", "data": {"error": str(e)}})
+        finally:
+            q.put(None)  # sentinel: close the stream
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            if result is not None:
+                shutil.rmtree(os.path.dirname(result["img_dir"]), ignore_errors=True)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def event_source():
+        while True:
+            item = await asyncio.to_thread(q.get)
+            if item is None:
+                return
+            payload = json.dumps(item["data"])
+            yield f"event: {item['event']}\ndata: {payload}\n\n"
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

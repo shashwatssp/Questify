@@ -16,6 +16,7 @@ import io
 import tempfile
 import zipfile
 from collections import Counter
+from typing import Callable, Optional
 from PIL import Image
 
 
@@ -656,8 +657,17 @@ def extract_metadata(doc):
 
 # ── Public API ───────────────────────────────────────────────────
 
-def process_pdf(pdf_path: str, output_dir: str | None = None):
-    """Full extraction pipeline.  Auto-detects PDF format."""
+def process_pdf(
+    pdf_path: str,
+    output_dir: str | None = None,
+    on_progress: Optional[Callable[[dict], None]] = None,
+):
+    """Full extraction pipeline.  Auto-detects PDF format.
+
+    If `on_progress` is provided, it is called with progress event dicts
+    ({\"event\": \"progress-start\"|\"progress-question\", \"data\": {...}}) so an
+    SSE endpoint can stream extraction progress to the client.
+    """
     if output_dir is None:
         output_dir = tempfile.mkdtemp(prefix="qextract_")
 
@@ -680,12 +690,23 @@ def process_pdf(pdf_path: str, output_dir: str | None = None):
             "Supported formats: Q.1/Q.2/... or 1./2./... numbering."
         )
 
+    # Announce the target counts up-front so the client can render a real
+    # progress bar instead of an indeterminate spinner.
+    if on_progress is not None:
+        on_progress({
+            "event": "progress-start",
+            "data": {
+                "total_pages": doc.page_count,
+                "total_questions": len(positions),
+            },
+        })
+
     # Step 3: extract each question
     questions = []
     opt_re = config["opt_re"]
     answer_re = config.get("answer_re")
 
-    for pos in positions:
+    for i, pos in enumerate(positions, start=1):
         qid, pg = pos["id"], pos["page"]
         ys, ye = pos["y_start"], pos["y_end"]
 
@@ -723,6 +744,18 @@ def process_pdf(pdf_path: str, output_dir: str | None = None):
             "raw_text": full_text,
             "page": pg + 1,
         })
+
+        # Report per-question progress as each question is completed.
+        if on_progress is not None:
+            on_progress({
+                "event": "progress-question",
+                "data": {
+                    "index": i,
+                    "count": i,
+                    "total": len(positions),
+                    "page": pg + 1,
+                },
+            })
 
     doc.close()
 
