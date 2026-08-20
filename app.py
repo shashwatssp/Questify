@@ -26,11 +26,13 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import os
 import shutil
 import tempfile
 import threading
-from queue import SimpleQueue
+import time
+from queue import Empty, SimpleQueue
 from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -39,6 +41,26 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 
 from extractor import process_pdf
+
+# ── Logging ─────────────────────────────────────────────────────
+# Structured, timestamped logs to stdout/stderr so every extraction phase is
+# observable in Render's log stream (the service previously had NO app-level
+# logging, which is why large-PDF failures were impossible to diagnose).
+logging.basicConfig(
+    level=os.environ.get("QUESTIFY_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("questify")
+
+# ── Timeouts ────────────────────────────────────────────────────
+# Hard cap on how long a single extraction may run. Bounds CPU-bound parsing so
+# the service never hangs silently on a huge PDF — it fails loudly with a
+# progress-error frame instead. Override via the env var in seconds.
+EXTRACTION_TIMEOUT = float(os.environ.get("EXTRACTION_TIMEOUT", "300"))
+# How often the SSE endpoint emits a heartbeat while the worker is alive but
+# not producing events, so clients/proxies can detect a live-but-silent stream
+# (preventing a connection being dropped mid-parse for large files).
+HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
 
 app = FastAPI(title="Questify", version="0.1.0")
 
@@ -133,7 +155,7 @@ def _inline_images(result: dict) -> dict:
     return data
 
 
-def _process_pdf_sync(tmp_path: str) -> dict:
+def _process_pdf_sync(tmp_path: str, timeout: float | None = None) -> dict:
     """Run process_pdf + inline images as base64.
 
     Extracted into a standalone sync function so the async /extract endpoint
@@ -141,8 +163,10 @@ def _process_pdf_sync(tmp_path: str) -> dict:
     event loop free to handle concurrent requests from multiple users.
     Each call gets its own temp output dir (mkdtemp inside process_pdf),
     so there are no shared-file collisions across concurrent invocations.
+    `timeout` is forwarded to process_pdf's internal deadline checks so a runaway
+    extraction raises TimeoutError instead of hanging forever.
     """
-    result = process_pdf(tmp_path)
+    result = process_pdf(tmp_path, timeout=timeout)
     _inline_images(result)  # mutates result["data"] in place; keep full dict for cleanup
     return result
 
@@ -171,24 +195,44 @@ async def extract(file: UploadFile = File(...)):
     content = await file.read()
     kind = _media_kind(content)
     if not kind:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        logger.warning("extract: rejected unsupported upload name=%s bytes=%d", file.filename, len(content))
         raise HTTPException(400, "Only PDF or image files are supported.")
     tmp_path = os.path.join(upload_dir, base if kind == "pdf" else f"upload.{kind}")
     with open(tmp_path, "wb") as f:
         f.write(content)
+    logger.info("extract: START kind=%s bytes=%d name=%s", kind, len(content), base)
     result: Optional[dict] = None
     try:
         if kind == "pdf":
-            result = await asyncio.to_thread(_process_pdf_sync, tmp_path)
+            # Run in a worker thread with BOTH an internal deadline (process_pdf
+            # raises TimeoutError so cleanup runs) and an outer asyncio timeout as a
+            # hard cap for any single call that can't be interrupted. A bounded
+            # timeout is what turns a silent hang into a loud, logged 504.
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_process_pdf_sync, tmp_path, EXTRACTION_TIMEOUT),
+                timeout=EXTRACTION_TIMEOUT + 5,
+            )
             data = result["data"]
+            logger.info("extract: DONE kind=pdf questions=%d", len(data.get("questions", [])))
         else:
             # Raster image: no selectable text layer. Return it as a single
             # image-backed question so it still enters the review flow, where the
             # teacher can crop and run on-demand OCR per question.
             data = await asyncio.to_thread(_process_image_sync, content, base)
+            logger.info("extract: DONE kind=%s", kind)
         return JSONResponse(content=data)
     except HTTPException:
         raise
+    except TimeoutError as e:
+        logger.error("extract: TIMED OUT kind=%s name=%s error=%s", kind, base, e)
+        raise HTTPException(
+            504,
+            f"Extraction timed out after {EXTRACTION_TIMEOUT:.0f}s. The PDF/image may be "
+            "too large or complex; try a smaller file or fewer pages.",
+        ) from e
     except Exception as e:  # surface extraction failures as a clean HTTP error
+        logger.exception("extract: FAILED kind=%s name=%s", kind, base)
         raise HTTPException(500, f"Extraction failed: {e}") from e
     finally:
         # Clean up this request's scratch files (upload dir + process_pdf output).
@@ -207,7 +251,16 @@ async def extract_stream(file: UploadFile = File(...)):
     Streams API. Emits, in order: progress-start, one progress-question per
     extracted question, then progress-done (or progress-error). POST /extract
     remains the non-streaming fallback and returns an identical payload.
+
+    The worker runs in a background thread bounded by `EXTRACTION_TIMEOUT` (an
+    internal deadline inside process_pdf turns a runaway parse into a
+    `progress-error` frame instead of a silent, forever-hung stream). While
+    the worker is alive but quiet a `progress-heartbeat` frame is emitted every
+    `HEARTBEAT_INTERVAL` seconds so clients and proxies can tell the request is
+    still alive (this is what prevents large files from looking like they "never
+    start parsing").
     """
+    start = time.monotonic()
     upload_dir = tempfile.mkdtemp(prefix="questify_upload_")
     base = (file.filename or "upload")
     for c in ("/", " ", chr(92)):
@@ -215,12 +268,17 @@ async def extract_stream(file: UploadFile = File(...)):
     content = await file.read()
     kind = _media_kind(content)
     if not kind:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        logger.warning("stream: rejected unsupported upload name=%s bytes=%d", file.filename, len(content))
         raise HTTPException(400, "Only PDF or image files are supported.")
     tmp_path = os.path.join(upload_dir, base if kind == "pdf" else f"upload.{kind}")
     with open(tmp_path, "wb") as f:
         f.write(content)
 
+    logger.info("stream: START kind=%s bytes=%d name=%s timeout=%ss", kind, len(content), base, EXTRACTION_TIMEOUT)
+
     q: SimpleQueue = SimpleQueue()
+    worker_done = threading.Event()
 
     def on_progress(event: dict) -> None:
         q.put(event)
@@ -229,8 +287,11 @@ async def extract_stream(file: UploadFile = File(...)):
         result = None
         try:
             if kind == "pdf":
-                result = process_pdf(tmp_path, on_progress=on_progress)
+                result = process_pdf(tmp_path, on_progress=on_progress,
+                                     timeout=EXTRACTION_TIMEOUT)
                 data = _inline_images(result)
+                logger.info("stream: process_pdf completed in %.2fs questions=%d",
+                            time.monotonic() - start, len(data.get("questions", [])))
             else:
                 # Raster image: single image-backed question (no text layer).
                 data = _process_image_sync(content, base)
@@ -239,9 +300,14 @@ async def extract_stream(file: UploadFile = File(...)):
                 q.put({"event": "progress-question",
                        "data": {"index": 1, "count": 1, "total": 1, "page": 1}})
             q.put({"event": "progress-done", "data": data})
+        except TimeoutError as e:
+            logger.error("stream: TIMED OUT name=%s elapsed=%.1fs error=%s", base, time.monotonic() - start, e)
+            q.put({"event": "progress-error", "data": {"error": str(e)}})
         except Exception as e:
+            logger.exception("stream: extraction FAILED name=%s", base)
             q.put({"event": "progress-error", "data": {"error": str(e)}})
         finally:
+            worker_done.set()
             q.put(None)  # sentinel: close the stream
             shutil.rmtree(upload_dir, ignore_errors=True)
             if result is not None:
@@ -249,9 +315,29 @@ async def extract_stream(file: UploadFile = File(...)):
 
     threading.Thread(target=worker, daemon=True).start()
 
+    # Block briefly on each get so a long-silent worker (common for large PDFs
+    # stuck in detection/rendering) still produces keep-alive frames instead of
+    # letting an idle proxy tear the connection down → silent failure.
+    _TIMEOUT = object()
+
+    def _safe_get(block: bool, timeout: float):
+        try:
+            return q.get(block, timeout)
+        except Empty:
+            return _TIMEOUT
+
     async def event_source():
         while True:
-            item = await asyncio.to_thread(q.get)
+            item = await asyncio.to_thread(_safe_get, True, HEARTBEAT_INTERVAL)
+            if item is _TIMEOUT:
+                if worker_done.is_set():
+                    return
+                # Worker alive but quiet — emit a heartbeat so the client/proxy
+                # knows the stream is still in progress.
+                yield ("event: progress-heartbeat\ndata: "
+                       + json.dumps({"elapsed": round(time.monotonic() - start, 1)})
+                       + "\n\n")
+                continue
             if item is None:
                 return
             payload = json.dumps(item["data"])

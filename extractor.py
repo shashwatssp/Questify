@@ -10,14 +10,18 @@ Supports JEE, GATE, NEET, and similar exam formats.
 
 import pymupdf as fitz
 import json
+import logging
 import re
 import os
 import io
+import time
 import tempfile
 import zipfile
 from collections import Counter
 from typing import Callable, Optional
 from PIL import Image
+
+logger = logging.getLogger("questify.extractor")
 
 
 # ── Unicode to LaTeX mapping ─────────────────────────────────────
@@ -511,21 +515,43 @@ def extract_figures(doc, page_num, y_start, y_end, q_id, img_dir, config):
     return figures
 
 
+def _check_deadline(deadline, t0, stage, pdf_path):
+    """Raise TimeoutError if the extraction budget has been consumed."""
+    if deadline is not None and time.monotonic() > deadline:
+        elapsed = time.monotonic() - t0
+        logger.error("Extraction timed out after %.1fs while %s (path=%s)",
+                     elapsed, stage, pdf_path)
+        raise TimeoutError(
+            f"Extraction exceeded the configured timeout during {stage} "
+            f"(elapsed {elapsed:.1f}s) for {os.path.basename(pdf_path)}"
+        )
+
+
 def render_question_image(doc, pdf_path, page_num, y_start, y_end,
-                          q_id, img_dir, config):
+                          q_id, img_dir, config, tmp_doc=None):
     """
     Render the question region at 2x as a clean PNG.
     - Replaces watermarks/logos/separator images with a transparent pixel.
     - Redacts "Answer (N)" text lines so they don't appear in the render.
     Works on a temporary copy to avoid mutating the original document.
+
+    `tmp_doc`, when supplied by the caller, is a *single reusable* open document
+    shared across all questions. This avoids re-opening (i.e. re-reading + re-
+    parsing) the entire PDF from disk for every question — the previous
+    behaviour was O(questions x parse) and is the dominant cost for large PDFs,
+    often making a 9-10MB file appear to "not even start parsing". When omitted,
+    the function falls back to opening its own copy (backward compatible).
     """
     skip_img_sizes = config.get("skip_img_sizes", set())
     answer_re = config.get("answer_re")
 
     needs_tmp = bool(skip_img_sizes) or bool(answer_re)
+    own_doc = False
 
     if needs_tmp:
-        tmp_doc = fitz.open(pdf_path)
+        if tmp_doc is None:
+            tmp_doc = fitz.open(pdf_path)
+            own_doc = True
         page = tmp_doc[page_num]
 
         # Remove unwanted images (watermarks, logos, separator lines)
@@ -571,7 +597,7 @@ def render_question_image(doc, pdf_path, page_num, y_start, y_end,
     fname = f"q{q_id}_rendered.png"
     pix.save(os.path.join(img_dir, fname))
 
-    if tmp_doc:
+    if tmp_doc and own_doc:
         tmp_doc.close()
     return fname
 
@@ -661,103 +687,151 @@ def process_pdf(
     pdf_path: str,
     output_dir: str | None = None,
     on_progress: Optional[Callable[[dict], None]] = None,
+    timeout: float | None = None,
 ):
     """Full extraction pipeline.  Auto-detects PDF format.
 
     If `on_progress` is provided, it is called with progress event dicts
-    ({\"event\": \"progress-start\"|\"progress-question\", \"data\": {...}}) so an
-    SSE endpoint can stream extraction progress to the client.
+    ({"event": "progress-start"|"progress-question"|"progress-heartbeat",
+     "data": {...}}) so an SSE endpoint can stream extraction progress to the
+    client. If `timeout` (seconds) is given, a TimeoutError is raised once it is
+    exceeded so the caller can surface a clean error instead of hanging silently.
     """
+    t0 = time.monotonic()
+    deadline = (t0 + timeout) if timeout else None
     if output_dir is None:
         output_dir = tempfile.mkdtemp(prefix="qextract_")
-
     img_dir = os.path.join(output_dir, "images")
     os.makedirs(img_dir, exist_ok=True)
 
+    size_bytes = os.path.getsize(pdf_path)
+    logger.info("process_pdf START path=%s size=%s timeout=%s", pdf_path, size_bytes, timeout)
+
     doc = fitz.open(pdf_path)
+    logger.info("process_pdf: document opened pages=%d", doc.page_count)
 
-    # Step 1: auto-detect
-    config = detect_pdf_format(doc)
-    config["skip_lines"] = _detect_header_footer(doc)
-    meta = extract_metadata(doc)
+    # Open a single reusable temp copy ONLY when redaction is needed, instead of
+    # re-opening the whole PDF from disk for every question (O(questions) parses,
+    # which is the dominant cost / silent-failure cause for large PDFs).
+    tmp_doc = None
+    try:
+        # Step 1: auto-detect
+        logger.info("process_pdf: detecting PDF format ...")
+        config = detect_pdf_format(doc)
+        _check_deadline(deadline, t0, "auto-detect format", pdf_path)
+        logger.info("process_pdf: detecting header/footer ...")
+        # Scan first 20 pages for repeated header/footer text.
+        config["skip_lines"] = _detect_header_footer(doc)
+        _check_deadline(deadline, t0, "detect header/footer", pdf_path)
+        logger.info("process_pdf: extracting metadata ...")
+        meta = extract_metadata(doc)
+        _check_deadline(deadline, t0, "extract metadata", pdf_path)
 
-    # Step 2: find questions
-    positions = find_question_positions(doc, config)
-    if not positions:
-        doc.close()
-        raise ValueError(
-            "Could not find any questions in this PDF. "
-            "Supported formats: Q.1/Q.2/... or 1./2./... numbering."
-        )
+        # Step 2: find questions
+        logger.info("process_pdf: locating question positions ...")
+        positions = find_question_positions(doc, config)
+        _check_deadline(deadline, t0, "locate questions", pdf_path)
+        logger.info("process_pdf: found %d questions in %.2fs", len(positions),
+                     time.monotonic() - t0)
 
-    # Announce the target counts up-front so the client can render a real
-    # progress bar instead of an indeterminate spinner.
-    if on_progress is not None:
-        on_progress({
-            "event": "progress-start",
-            "data": {
-                "total_pages": doc.page_count,
-                "total_questions": len(positions),
-            },
-        })
+        if not positions:
+            logger.warning("process_pdf: no questions found in %s", pdf_path)
+            raise ValueError(
+                "Could not find any questions in this PDF. "
+                "Supported formats: Q.1/Q.2/... or 1./2./... numbering."
+            )
 
-    # Step 3: extract each question
-    questions = []
-    opt_re = config["opt_re"]
-    answer_re = config.get("answer_re")
-
-    for i, pos in enumerate(positions, start=1):
-        qid, pg = pos["id"], pos["page"]
-        ys, ye = pos["y_start"], pos["y_end"]
-
-        full_text, eq_raw = extract_text_and_equations(
-            doc, pg, ys, ye, config)
-        options = parse_options(full_text, config)
-        q_type = classify_question(full_text, options, config)
-
-        equations = [{"raw_text": r, "latex": _unicode_to_latex(r)}
-                     for r in eq_raw]
-        figures = extract_figures(doc, pg, ys, ye, qid, img_dir, config)
-        rendered = render_question_image(doc, pdf_path, pg, ys, ye, qid,
-                                         img_dir, config)
-
-        # Clean question text: drop options and answer lines
-        lines = full_text.split("\n")
-        clean, hit_opts = [], False
-        for ln in lines:
-            if opt_re.match(ln.strip()):
-                hit_opts = True
-            if answer_re and answer_re.match(ln.strip()):
-                continue
-            if not hit_opts:
-                clean.append(ln)
-        question_text = "\n".join(clean).strip() or full_text.strip()
-
-        questions.append({
-            "id": qid,
-            "text": question_text,
-            "type": q_type,
-            "options": options,
-            "equations": equations,
-            "figures": figures,
-            "rendered_image": rendered,
-            "raw_text": full_text,
-            "page": pg + 1,
-        })
-
-        # Report per-question progress as each question is completed.
+        # Announce the page count ASAP so the client isn't staring at a dead
+        # spinner while detection runs (the main cause of "not even starting").
         if on_progress is not None:
             on_progress({
-                "event": "progress-question",
+                "event": "progress-start",
                 "data": {
-                    "index": i,
-                    "count": i,
-                    "total": len(positions),
-                    "page": pg + 1,
+                    "total_pages": doc.page_count,
+                    "total_questions": None,  # unknown until detection finishes
                 },
             })
 
-    doc.close()
+        needs_tmp = bool(config.get("skip_img_sizes")) or bool(config.get("answer_re"))
+        if needs_tmp:
+            tmp_doc = fitz.open(pdf_path)
+            logger.info("process_pdf: opened reusable temp doc for redaction")
+
+        # Now that detection finished, announce the real question count.
+        if on_progress is not None:
+            on_progress({
+                "event": "progress-start",
+                "data": {
+                    "total_pages": doc.page_count,
+                    "total_questions": len(positions),
+                },
+            })
+
+        # Step 3: extract each question
+        questions = []
+        opt_re = config["opt_re"]
+        answer_re = config.get("answer_re")
+
+        for i, pos in enumerate(positions, start=1):
+            qid, pg = pos["id"], pos["page"]
+            ys, ye = pos["y_start"], pos["y_end"]
+
+            full_text, eq_raw = extract_text_and_equations(
+                doc, pg, ys, ye, config)
+            options = parse_options(full_text, config)
+            q_type = classify_question(full_text, options, config)
+
+            equations = [{"raw_text": r, "latex": _unicode_to_latex(r)}
+                         for r in eq_raw]
+            figures = extract_figures(doc, pg, ys, ye, qid, img_dir, config)
+            rendered = render_question_image(doc, pdf_path, pg, ys, ye, qid,
+                                             img_dir, config, tmp_doc=tmp_doc)
+
+            # Clean question text: drop options and answer lines
+            lines = full_text.split("\n")
+            clean, hit_opts = [], False
+            for ln in lines:
+                if opt_re.match(ln.strip()):
+                    hit_opts = True
+                if answer_re and answer_re.match(ln.strip()):
+                    continue
+                if not hit_opts:
+                    clean.append(ln)
+            question_text = "\n".join(clean).strip() or full_text.strip()
+
+            questions.append({
+                "id": qid,
+                "text": question_text,
+                "type": q_type,
+                "options": options,
+                "equations": equations,
+                "figures": figures,
+                "rendered_image": rendered,
+                "raw_text": full_text,
+                "page": pg + 1,
+            })
+
+            logger.info("process_pdf: question %d/%d id=%s page=%d done (%.2fs)",
+                        i, len(positions), qid, pg + 1, time.monotonic() - t0)
+            _check_deadline(deadline, t0, f"question {qid} render", pdf_path)
+
+            # Report per-question progress as each question is completed.
+            if on_progress is not None:
+                on_progress({
+                    "event": "progress-question",
+                    "data": {
+                        "index": i,
+                        "count": i,
+                        "total": len(positions),
+                        "page": pg + 1,
+                    },
+                })
+    finally:
+        # Guarantee cleanup even on timeout/exception so we never leak open docs
+        # (important when a large PDF is abandoned due to timeout).
+        if tmp_doc is not None:
+            tmp_doc.close()
+        doc.close()
 
     data = {
         **meta,
@@ -776,6 +850,8 @@ def process_pdf(
         for fname in os.listdir(img_dir):
             zf.write(os.path.join(img_dir, fname), f"images/{fname}")
 
+    logger.info("process_pdf DONE path=%s questions=%d elapsed=%.2fs", pdf_path,
+                len(questions), time.monotonic() - t0)
     return {
         "json_path": json_path,
         "img_dir": img_dir,
