@@ -32,6 +32,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from queue import Empty, SimpleQueue
 from typing import Optional
 
@@ -56,11 +57,25 @@ logger = logging.getLogger("questify")
 # Hard cap on how long a single extraction may run. Bounds CPU-bound parsing so
 # the service never hangs silently on a huge PDF — it fails loudly with a
 # progress-error frame instead. Override via the env var in seconds.
-EXTRACTION_TIMEOUT = float(os.environ.get("EXTRACTION_TIMEOUT", "300"))
+EXTRACTION_TIMEOUT = float(os.environ.get("EXTRACTION_TIMEOUT", "1800"))
 # How often the SSE endpoint emits a heartbeat while the worker is alive but
 # not producing events, so clients/proxies can detect a live-but-silent stream
 # (preventing a connection being dropped mid-parse for large files).
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
+
+# --- Async job registry (POST /extract/start -> GET /extract/status/{job_id}) ---
+# Decouples long extractions from a single long-lived HTTP connection: the file
+# is saved and a background thread runs process_pdf while the client polls
+# status by job_id. This defeats SSE proxy buffering, browser tab throttling and
+# Render's connection limits -- the browser can close/reopen and resume polling
+# the same job_id. The free tier (512MB) is memory-bounded by JOB_TTL.
+JOBS: dict = {}
+JOB_TTL = float(os.environ.get("JOB_TTL", "3600"))          # hard cap incl. running
+JOB_DONE_TTL = float(os.environ.get("JOB_DONE_TTL", "300")) # reap terminal jobs after this
+JOB_SWEEP_INTERVAL = float(os.environ.get("JOB_SWEEP_INTERVAL", "60"))
+# Rough per-question seconds used to estimate total time before the client has
+# a full answer count. Tuned for Render free-tier shared CPU.
+ESTIMATE_SECS_PER_QUESTION = float(os.environ.get("ESTIMATE_SECS_PER_QUESTION", "5.0"))
 
 app = FastAPI(title="Questify", version="0.1.0")
 
@@ -351,3 +366,175 @@ async def extract_stream(file: UploadFile = File(...)):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── Async job model (POST /extract/start -> GET /extract/status/{job_id}) ──
+def _init_job_state() -> dict:
+    """Fresh state dict for a new extraction job."""
+    now = time.monotonic()
+    return {
+        "status": "running",
+        "processed": 0,
+        "total": None,
+        "total_pages": None,
+        "error": None,
+        "data": None,
+        "created_at": now,
+        "updated_at": now,
+        "done_at": None,
+    }
+
+
+def _job_on_progress(state: dict, event: dict) -> None:
+    """Translate process_pdf progress events into JOBS state fields."""
+    ev = event.get("event")
+    d = event.get("data") or {}
+    if ev == "progress-start":
+        if d.get("total_questions") is not None:
+            state["total"] = d["total_questions"]
+        if d.get("total_pages") is not None:
+            state["total_pages"] = d["total_pages"]
+    elif ev == "progress-question":
+        state["processed"] = d.get("count", d.get("index", 0))
+        if d.get("total") is not None:
+            state["total"] = d["total"]
+    state["updated_at"] = time.monotonic()
+
+
+def _run_job(job_id: str, kind: str, tmp_path: str, base: str,
+             content: bytes, upload_dir: str) -> None:
+    """Background worker: runs process_pdf() (same logic as the SSE worker)
+    and records progress + the final result into JOBS[job_id]."""
+    state = JOBS[job_id]
+    result = None
+    try:
+        if kind == "pdf":
+            logger.info("job: worker running job=%s path=%s", job_id, tmp_path)
+            result = process_pdf(
+                tmp_path,
+                on_progress=lambda ev: _job_on_progress(state, ev),
+                timeout=EXTRACTION_TIMEOUT,
+            )
+            data = _inline_images(result)
+            state["processed"] = len(data.get("questions", []))
+            state["total"] = len(data.get("questions", []))
+            state["status"] = "done"
+            state["data"] = data
+            logger.info("job: DONE job=%s questions=%d", job_id, len(data.get("questions", [])))
+        else:
+            data = _process_image_sync(content, base)
+            state["processed"] = 1
+            state["total"] = 1
+            state["total_pages"] = 1
+            state["status"] = "done"
+            state["data"] = data
+    except TimeoutError as e:
+        logger.error("job: TIMED OUT job=%s error=%s", job_id, e)
+        state["status"] = "error"
+        state["error"] = str(e)
+    except Exception as e:
+        logger.exception("job: FAILED job=%s", job_id)
+        state["status"] = "error"
+        state["error"] = str(e)
+    finally:
+        state["done_at"] = time.monotonic()
+        state["updated_at"] = time.monotonic()
+        # Images are already inlined as base64 in state["data"]; release the
+        # per-question scratch dir now so memory is freed before the sweep.
+        if result is not None:
+            shutil.rmtree(os.path.dirname(result["img_dir"]), ignore_errors=True)
+        shutil.rmtree(upload_dir, ignore_errors=True)
+
+
+def _jobs_sweep():
+    """Background reaper: drop terminal jobs after JOB_DONE_TTL and any job
+    older than JOB_TTL. Bounds memory on the 512MB free tier."""
+    while True:
+        time.sleep(JOB_SWEEP_INTERVAL)
+        now = time.monotonic()
+        for jid in list(JOBS.keys()):
+            st = JOBS[jid]
+            age = now - st["created_at"]
+            if st["status"] == "running":
+                if age > JOB_TTL:
+                    logger.warning("job: sweep expired running job=%s age=%.0fs", jid, age)
+                    JOBS.pop(jid, None)
+            else:
+                done_at = st.get("done_at") or st["updated_at"]
+                if (now - done_at) > JOB_DONE_TTL or age > JOB_TTL:
+                    logger.info("job: sweep reaped terminal job=%s status=%s", jid, st["status"])
+                    JOBS.pop(jid, None)
+
+
+@app.post("/extract/start")
+async def extract_start(file: UploadFile = File(...)):
+    """Start an async extraction job.
+
+    Saves the upload to disk, immediately returns {"job_id": "..."} and runs
+    process_pdf() in a background thread (same logic as /extract/stream, just
+    writing progress into JOBS instead of an SSE stream). Poll
+    GET /extract/status/{job_id} for progress and the final result.
+
+    Recommended for large PDFs (100-300+ questions) on the free tier: no
+    long-lived HTTP connection to drop, so the browser can be closed/reopened
+    and resume polling the same job_id. POST /extract and POST /extract/stream
+    remain for backward compatibility.
+    """
+    upload_dir = tempfile.mkdtemp(prefix="questify_upload_")
+    base = (file.filename or "upload").replace("/", "_").replace("\\", "_")
+    content = await file.read()
+    kind = _media_kind(content)
+    if not kind:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        logger.warning("start: rejected unsupported upload name=%s bytes=%d",
+                       file.filename, len(content))
+        raise HTTPException(400, "Only PDF or image files are supported.")
+    tmp_path = os.path.join(upload_dir, base if kind == "pdf" else f"upload.{kind}")
+    with open(tmp_path, "wb") as f:
+        f.write(content)
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = _init_job_state()
+    logger.info("start: START job=%s kind=%s bytes=%d", job_id, kind, len(content))
+    threading.Thread(
+        target=_run_job,
+        args=(job_id, kind, tmp_path, base, content, upload_dir),
+        daemon=True,
+        name=f"questify-job-{job_id[:8]}",
+    ).start()
+    return JSONResponse(content={"job_id": job_id, "status": "running"})
+
+
+@app.get("/extract/status/{job_id}")
+def extract_status(job_id: str):
+    """Poll an extraction job.
+
+    Returns progress (processed/total) while running, and the full `data`
+    payload once status == "done". 404 if missing/expired (reaped
+    JOB_DONE_TTL seconds after a terminal state, or JOB_TTL hard cap).
+    """
+    state = JOBS.get(job_id)
+    if state is None:
+        raise HTTPException(
+            404,
+            "Job not found. It may have expired after completion "
+            f"({int(JOB_DONE_TTL)}s after a terminal state, {int(JOB_TTL)}s hard cap).",
+        )
+    total = state["total"]
+    out = {
+        "job_id": job_id,
+        "status": state["status"],
+        "processed": state["processed"],
+        "total": total,
+        "total_pages": state.get("total_pages"),
+        "error": state.get("error"),
+        "estimated_seconds": total * ESTIMATE_SECS_PER_QUESTION if total else None,
+    }
+    if state["status"] == "done" and state["data"] is not None:
+        out["data"] = state["data"]
+    return JSONResponse(content=out)
+
+
+# Start the job-reaper sweep once at import time (Render runs a single uvicorn
+# worker, so one reaper thread covers all jobs in this process).
+threading.Thread(target=_jobs_sweep, daemon=True, name="questify-job-sweep").start()
+

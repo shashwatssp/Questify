@@ -49,6 +49,17 @@ MATH_FONT_KEYWORDS = ("Type3", "CambriaMath", "MathJax", "CMMI", "CMSY",
 # Minimum aspect ratio to consider an image a separator line
 LINE_ASPECT_RATIO = 12
 
+# ── Rasterization (render_question_image) ───────────────────────────
+# Base zoom used when rendering question bands to PNG. 2.0 == 2x (matches the
+# previous hard-coded behaviour). Override via RENDER_ZOOM for experimentation.
+RENDER_ZOOM = float(os.environ.get("RENDER_ZOOM", "2.0"))
+# Size-aware fallback: large PDFs on the free tier (throttled shared CPU) are
+# expensive to rasterize, so drop the zoom to keep total time sane. A job is
+# considered "large" when it exceeds either threshold.
+LARGE_PDF_QUESTIONS = int(os.environ.get("LARGE_PDF_QUESTIONS", "80"))
+LARGE_PDF_BYTES = int(os.environ.get("LARGE_PDF_BYTES", str(6 * 1024 * 1024)))
+LARGE_PDF_ZOOM = float(os.environ.get("LARGE_PDF_ZOOM", "1.5"))
+
 
 def _unicode_to_latex(text: str) -> str:
     result = text
@@ -527,24 +538,73 @@ def _check_deadline(deadline, t0, stage, pdf_path):
         )
 
 
-def render_question_image(doc, pdf_path, page_num, y_start, y_end,
-                          q_id, img_dir, config, tmp_doc=None):
+def _do_page_redactions(page_num, page, config, redacted_pages):
+    """Single redaction pass for one page of tmp_doc.
+
+    Replaces every excluded image size (watermarks / logos / separator lines) and
+    every "Answer (N)" / "Answer (A)" text line on the page, then calls
+    apply_redactions() ONCE. Idempotent via `redacted_pages` -- a page is never
+    redacted twice. Shared by process_pdf's per-page batch loop and the fallback
+    inside render_question_image for callers that do not pre-batch.
     """
-    Render the question region at 2x as a clean PNG.
+    skip_img_sizes = config.get("skip_img_sizes", set())
+    answer_re = config.get("answer_re")
+
+    if skip_img_sizes:
+        tiny = Image.new("RGBA", (1, 1), (255, 255, 255, 0))
+        buf = io.BytesIO()
+        tiny.save(buf, format="PNG")
+        tiny_bytes = buf.getvalue()
+        replaced = set()
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if xref in replaced:
+                continue
+            if (img_info[2], img_info[3]) in skip_img_sizes:
+                try:
+                    page.replace_image(xref, stream=tiny_bytes)
+                    replaced.add(xref)
+                except Exception:
+                    pass
+
+    if answer_re:
+        for block in page.get_text("dict")["blocks"]:
+            if block["type"] != 0:
+                continue
+            for line in block["lines"]:
+                full = "".join(s["text"] for s in line["spans"]).strip()
+                if answer_re.match(full):
+                    page.add_redact_annot(fitz.Rect(line["bbox"]), fill=(1, 1, 1))
+        page.apply_redactions()
+
+    redacted_pages.add(page_num)
+
+
+def render_question_image(doc, pdf_path, page_num, y_start, y_end,
+                          q_id, img_dir, config, tmp_doc=None,
+                          redacted_pages=None, zoom=None):
+    """
+    Render the question region as a clean PNG.
     - Replaces watermarks/logos/separator images with a transparent pixel.
     - Redacts "Answer (N)" text lines so they don't appear in the render.
     Works on a temporary copy to avoid mutating the original document.
 
     `tmp_doc`, when supplied by the caller, is a *single reusable* open document
     shared across all questions. This avoids re-opening (i.e. re-reading + re-
-    parsing) the entire PDF from disk for every question — the previous
+    parsing) the entire PDF from disk for every question -- the previous
     behaviour was O(questions x parse) and is the dominant cost for large PDFs,
     often making a 9-10MB file appear to "not even start parsing". When omitted,
     the function falls back to opening its own copy (backward compatible).
+
+    Per-page redaction is now done up-front by process_pdf (see the
+    "batch-redacted page" log): every excluded image and every "Answer (N)"
+    line on a page is cleared with a SINGLE apply_redactions() call instead of
+    once per question. `redacted_pages` tracks pages already processed so a
+    page is never redacted twice. When the page is already redacted this function
+    only crops + rasterizes from the (already clean) tmp_doc page.
     """
     skip_img_sizes = config.get("skip_img_sizes", set())
     answer_re = config.get("answer_re")
-
     needs_tmp = bool(skip_img_sizes) or bool(answer_re)
     own_doc = False
 
@@ -553,47 +613,24 @@ def render_question_image(doc, pdf_path, page_num, y_start, y_end,
             tmp_doc = fitz.open(pdf_path)
             own_doc = True
         page = tmp_doc[page_num]
-
-        # Remove unwanted images (watermarks, logos, separator lines)
-        if skip_img_sizes:
-            tiny = Image.new("RGBA", (1, 1), (255, 255, 255, 0))
-            buf = io.BytesIO()
-            tiny.save(buf, format="PNG")
-            tiny_bytes = buf.getvalue()
-
-            replaced = set()
-            for img_info in page.get_images(full=True):
-                xref = img_info[0]
-                if xref in replaced:
-                    continue
-                if (img_info[2], img_info[3]) in skip_img_sizes:
-                    try:
-                        page.replace_image(xref, stream=tiny_bytes)
-                        replaced.add(xref)
-                    except Exception:
-                        pass
-
-        # Redact answer lines (e.g. "Answer (2)")
-        if answer_re:
-            for block in page.get_text("dict")["blocks"]:
-                if block["type"] != 0:
-                    continue
-                for line in block["lines"]:
-                    ly = line["bbox"][1]
-                    if ly < y_start or ly > y_end:
-                        continue
-                    full = "".join(s["text"] for s in line["spans"]).strip()
-                    if answer_re.match(full):
-                        page.add_redact_annot(fitz.Rect(line["bbox"]),
-                                              fill=(1, 1, 1))
-            page.apply_redactions()
+        if redacted_pages is None:
+            redacted_pages = set()
+        # process_pdf pre-redacts all question pages in one batch. Only fall
+        # back to a single-page redaction here for callers that do not pre-batch;
+        # never redact the same page twice.
+        if page_num not in redacted_pages:
+            _do_page_redactions(page_num, page, config, redacted_pages)
+            logger.info("render_question_image: redacted page %d for q%d on demand",
+                        page_num + 1, q_id)
     else:
         tmp_doc = None
         page = doc[page_num]
 
+    if zoom is None:
+        zoom = RENDER_ZOOM
     clip = fitz.Rect(page.rect.x0, max(0, y_start - 5),
                      page.rect.x1, min(page.rect.height, y_end + 5))
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip)
     fname = f"q{q_id}_rendered.png"
     pix.save(os.path.join(img_dir, fname))
 
@@ -757,6 +794,34 @@ def process_pdf(
             tmp_doc = fitz.open(pdf_path)
             logger.info("process_pdf: opened reusable temp doc for redaction")
 
+        # --- Task 2: batch redaction, ONE apply_redactions() per page ---
+        # Group questions by page and redact each page a single time (all excluded
+        # images + all "Answer (N)" lines) instead of once per question. This
+        # removes the redundant apply_redactions() / image-scan per question that
+        # dominates runtime for large PDFs. redacted_pages guards against double
+        # redaction; render_question_image only crops+rasterizes afterwards.
+        redacted_pages: set = set()
+        if needs_tmp:
+            _by_page: dict = {}
+            for _pos in positions:
+                _by_page.setdefault(_pos["page"], []).append(_pos)
+            for _pg in sorted(_by_page):
+                _page = tmp_doc[_pg]
+                _do_page_redactions(_pg, _page, config, redacted_pages)
+                logger.info("batch-redacted page %d (%d questions)",
+                            _pg + 1, len(_by_page[_pg]))
+            _check_deadline(deadline, t0, "batch-redact pages", pdf_path)
+
+        # --- Task 3: size-aware rasterization zoom ---
+        # RENDER_ZOOM (default 2x) for normal PDFs. For large jobs on the free
+        # tier (throttled shared CPU), drop the render zoom to keep total time
+        # sane while still producing usable question bands.
+        zoom = RENDER_ZOOM
+        if len(positions) >= LARGE_PDF_QUESTIONS or size_bytes >= LARGE_PDF_BYTES:
+            zoom = min(zoom, LARGE_PDF_ZOOM)
+            logger.info("process_pdf: large PDF (questions=%d size=%d); zoom %.2f -> %.2f",
+                        len(positions), size_bytes, RENDER_ZOOM, zoom)
+
         # Now that detection finished, announce the real question count.
         if on_progress is not None:
             on_progress({
@@ -785,7 +850,9 @@ def process_pdf(
                          for r in eq_raw]
             figures = extract_figures(doc, pg, ys, ye, qid, img_dir, config)
             rendered = render_question_image(doc, pdf_path, pg, ys, ye, qid,
-                                             img_dir, config, tmp_doc=tmp_doc)
+                                             img_dir, config, tmp_doc=tmp_doc,
+                                             redacted_pages=redacted_pages,
+                                             zoom=zoom)
 
             # Clean question text: drop options and answer lines
             lines = full_text.split("\n")
