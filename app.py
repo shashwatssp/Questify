@@ -158,14 +158,21 @@ def _image_backed_question(b64: str, source_name: str) -> dict:
 def _inline_images(result: dict) -> dict:
     """Inline each question's rendered image + figures as base64 data-URLs
     so the frontend needs no second request. Shared by POST /extract and
-    POST /extract/stream so both return identical payloads."""
+    POST /extract/stream so both return identical payloads.
+
+    Idempotent: questions emitted incrementally by process_pdf already carry
+    their `rendered_image_b64` / figure `image_b64` (inlined at render time), so
+    we only fill in anything still missing. This keeps the per-question
+    streaming path and the final bundled payload consistent without re-encoding
+    images that were already inlined.
+    """
     data = result["data"]
     img_dir = result["img_dir"]
     for q in data.get("questions", []):
-        if q.get("rendered_image"):
+        if q.get("rendered_image") and not q.get("rendered_image_b64"):
             q["rendered_image_b64"] = _to_data_url(img_dir, q["rendered_image"])
         for fig in q.get("figures", []):
-            if fig.get("path"):
+            if fig.get("path") and not fig.get("image_b64"):
                 fig["image_b64"] = _to_data_url(img_dir, fig["path"])
     return data
 
@@ -379,6 +386,10 @@ def _init_job_state() -> dict:
         "total_pages": None,
         "error": None,
         "data": None,
+        # Accumulated, fully-inlined questions produced so far. Delivered to
+        # clients on every status poll so the teacher can start reviewing the
+        # first questions while the bulk of the PDF is still extracting.
+        "results": [],
         "created_at": now,
         "updated_at": now,
         "done_at": None,
@@ -398,6 +409,11 @@ def _job_on_progress(state: dict, event: dict) -> None:
         state["processed"] = d.get("count", d.get("index", 0))
         if d.get("total") is not None:
             state["total"] = d["total"]
+        # Attach the fully-inlined question (image + figures as base64) so the
+        # polling client can surface it immediately for incremental review.
+        q = d.get("question")
+        if q is not None:
+            state["results"].append(q)
     state["updated_at"] = time.monotonic()
 
 
@@ -528,6 +544,10 @@ def extract_status(job_id: str):
         "total_pages": state.get("total_pages"),
         "error": state.get("error"),
         "estimated_seconds": total * ESTIMATE_SECS_PER_QUESTION if total else None,
+        # Fully-inlined questions produced so far. Always present once extraction
+        # has started emitting questions (additive field -> old clients that
+        # don't read it are unaffected).
+        "results": state.get("results", []),
     }
     if state["status"] == "done" and state["data"] is not None:
         out["data"] = state["data"]
