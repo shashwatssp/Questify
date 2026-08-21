@@ -14,6 +14,7 @@ import logging
 import re
 import os
 import io
+import base64
 import time
 import tempfile
 import zipfile
@@ -580,6 +581,26 @@ def _do_page_redactions(page_num, page, config, redacted_pages):
     redacted_pages.add(page_num)
 
 
+def _to_data_url(img_dir: str, fname: Optional[str]) -> Optional[str]:
+    """Read an image file from `img_dir` and return it as a base64 data-URL.
+
+    Used to inline each question's rendered image + figure images directly into
+    the question payload *at render time*, so a complete (self-contained)
+    question can be attached to the per-question progress event and delivered
+    incrementally to the frontend while extraction of the remaining questions
+    continues. Idempotent with app._inline_images, which skips images that are
+    already inlined when the final bundled payload is built.
+    """
+    if not fname:
+        return None
+    path = os.path.join(img_dir, fname)
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
 def render_question_image(doc, pdf_path, page_num, y_start, y_end,
                           q_id, img_dir, config, tmp_doc=None,
                           redacted_pages=None, zoom=None):
@@ -866,7 +887,7 @@ def process_pdf(
                     clean.append(ln)
             question_text = "\n".join(clean).strip() or full_text.strip()
 
-            questions.append({
+            q = {
                 "id": qid,
                 "text": question_text,
                 "type": q_type,
@@ -876,7 +897,19 @@ def process_pdf(
                 "rendered_image": rendered,
                 "raw_text": full_text,
                 "page": pg + 1,
-            })
+            }
+            # Inline THIS question's own rendered image + figures as base64 now,
+            # so a complete (self-contained) question is attached to the
+            # per-question progress event and can be delivered to the frontend for
+            # incremental review while extraction of the remaining questions
+            # continues. app._inline_images is idempotent (skips already-set b64),
+            # so this is not re-run when the full result is built at the end.
+            if q.get("rendered_image"):
+                q["rendered_image_b64"] = _to_data_url(img_dir, q["rendered_image"])
+            for fig in q.get("figures", []):
+                if fig.get("path") and not fig.get("image_b64"):
+                    fig["image_b64"] = _to_data_url(img_dir, fig["path"])
+            questions.append(q)
 
             logger.info("process_pdf: question %d/%d id=%s page=%d done (%.2fs)",
                         i, len(positions), qid, pg + 1, time.monotonic() - t0)
@@ -891,6 +924,7 @@ def process_pdf(
                         "count": i,
                         "total": len(positions),
                         "page": pg + 1,
+                        "question": q,
                     },
                 })
     finally:
